@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+
+# Generated outputs
+artifacts/
+artifacts_*/
+generated_data/
+data/
+
+# Local reports and scratch exports
+*.html
+*.csv
+
