@@ -70,6 +70,20 @@ EMBEDDING_COLUMNS = [
     "is_uncommon_port",
 ]
 
+# ── Traffic class labels ───────────────────────────────────────────────────────
+# Maps each anomalous flow to one of these after the anomaly detector fires.
+# BENIGN is assigned to all non-anomalous flows.
+TRAFFIC_CLASSES = [
+    "BENIGN",
+    "DoS/DDoS",
+    "Port Scan",
+    "Brute Force",
+    "Web Attack",
+    "Botnet",
+    "Infiltration",
+    "Unknown Anomaly",
+]
+
 
 @dataclass
 class ScoreArtifacts:
@@ -144,6 +158,9 @@ class FlowMindAI:
         scored["risk_level"] = scored["anomaly_score"].apply(self._risk_label)
         scored["explanation"] = self._explain(embedding, scaled, scored)
 
+        # ── Multi-class traffic classification ────────────────────────────
+        scored["traffic_class"] = self._classify_traffic(embedding, scored)
+
         summary = {
             "total_flows": int(len(scored)),
             "flagged_flows": int(scored["is_anomaly"].sum()),
@@ -152,6 +169,10 @@ class FlowMindAI:
             "max_score": round(float(scored["anomaly_score"].max()), 4),
             "top_protocol": str(scored["protocol"].mode().iloc[0]) if not scored.empty else "N/A",
         }
+
+        # Class breakdown for report
+        summary["class_breakdown"] = scored["traffic_class"].value_counts().to_dict()
+
         if "label" in scored.columns:
             known_attack_mask = self._known_attack_mask(scored)
             known_normal_mask = self._known_normal_mask(scored)
@@ -256,7 +277,10 @@ class FlowMindAI:
                     max(1, len(scored_batch) // 3),
                     "anomaly_score",
                 ).drop(
-                    columns=["service", "anomaly_score", "is_anomaly", "risk_level", "explanation", "batch_id", "learning_phase"],
+                    columns=[
+                        "service", "anomaly_score", "is_anomaly", "risk_level",
+                        "explanation", "traffic_class", "batch_id", "learning_phase",
+                    ],
                     errors="ignore",
                 )
 
@@ -288,6 +312,11 @@ class FlowMindAI:
             "memory_size": int(memory_size),
             "skipped_relearn_batches": int(skipped_relearn_batches),
         }
+
+        # Class breakdown for report
+        if "traffic_class" in scored.columns:
+            summary["class_breakdown"] = scored["traffic_class"].value_counts().to_dict()
+
         if "label" in scored.columns:
             known_attack_mask = self._known_attack_mask(scored)
             known_normal_mask = self._known_normal_mask(scored)
@@ -430,6 +459,90 @@ class FlowMindAI:
             context = f"context={protocol}/{direction}/port-{port}"
             explanations.append(", ".join(parts + [context]))
         return explanations
+
+    @staticmethod
+    def _classify_traffic(embedding: pd.DataFrame, scored: pd.DataFrame) -> pd.Series:
+        """
+        Rule-based two-step classifier.
+
+        Step 1 (anomaly detector, already done): is_anomaly flag on each flow.
+        Step 2 (this method): map anomalous flows to a named attack class using
+                              embedding signals and flow metadata.
+
+        Classes (in priority order):
+          BENIGN          – not flagged by the anomaly detector
+          DoS/DDoS        – high pps + high SYN ratio + TCP
+          Port Scan       – high SYN + low bytes/pkt + failed connections
+          Brute Force     – admin-service port + auth failures
+          Web Attack      – web-service port (80/443/8080) + anomalous
+          Botnet          – regular beacon timing (low inter-arrival CV)
+          Infiltration    – large byte transfer to uncommon/non-standard port
+          Unknown Anomaly – anomalous but no specific signature matches
+        """
+        labels = pd.Series("BENIGN", index=scored.index, dtype=str)
+        anomaly_mask = scored["is_anomaly"].fillna(False).to_numpy()
+
+        if not anomaly_mask.any():
+            return labels
+
+        # ── Embedding signals ─────────────────────────────────────────────
+        syn   = embedding["tcp_syn_ratio"].to_numpy()
+        pps   = embedding["packets_per_sec"].to_numpy()        # log-scaled
+        bps   = embedding["bytes_per_sec"].to_numpy()          # log-scaled
+        bpp   = embedding["bytes_per_packet"].to_numpy()
+        iat_m = embedding["log_inter_arrival_mean_ms"].to_numpy()
+        iat_s = embedding["log_inter_arrival_std_ms"].to_numpy()
+        fail  = scored["failed_connections"].to_numpy().astype(float)
+
+        is_tcp        = embedding["is_tcp"].to_numpy().astype(bool)
+        is_web_port   = embedding["is_web_service"].to_numpy().astype(bool)
+        is_admin_port = embedding["is_admin_service"].to_numpy().astype(bool)
+        is_uncommon   = embedding["is_uncommon_port"].to_numpy().astype(bool)
+
+        # ── Adaptive thresholds (computed from anomalous subset) ──────────
+        anom_idx = np.where(anomaly_mask)[0]
+        pps_hi = float(np.percentile(pps[anom_idx], 60)) if len(anom_idx) else 0.0
+        bps_hi = float(np.percentile(bps[anom_idx], 60)) if len(anom_idx) else 0.0
+        bpp_lo = float(np.percentile(bpp[anom_idx], 40)) if len(anom_idx) else 0.0
+
+        # Coefficient of variation for inter-arrival time  (low = regular beacon)
+        iat_cv = np.where(iat_m > 0.1, iat_s / (iat_m + 1e-6), 1.0)
+
+        # ── Classify each anomalous flow ──────────────────────────────────
+        for i in anom_idx:
+            label = "Unknown Anomaly"
+
+            # Botnet / C2 beacon: very regular timing, moderate traffic volume
+            if iat_cv[i] < 0.35 and pps[i] < pps_hi:
+                label = "Botnet"
+
+            # Infiltration / data exfiltration: high throughput to non-standard port
+            elif bps[i] >= bps_hi and is_uncommon[i]:
+                label = "Infiltration"
+
+            # Web Attack: HTTP/HTTPS port is the primary destination
+            elif is_web_port[i]:
+                label = "Web Attack"
+
+            # Brute Force: SSH/RDP/Telnet/SMB + at least one auth failure
+            elif is_admin_port[i] and fail[i] >= 1:
+                label = "Brute Force"
+
+            # Port Scan: high SYN, tiny payloads, connection failures
+            elif syn[i] >= 0.55 and bpp[i] <= bpp_lo and fail[i] >= 1:
+                label = "Port Scan"
+
+            # DoS/DDoS: high packet rate + elevated SYN + TCP protocol
+            elif pps[i] >= pps_hi and syn[i] >= 0.35 and is_tcp[i]:
+                label = "DoS/DDoS"
+
+            # DoS/DDoS (volume-based): saturating both bps and pps
+            elif bps[i] >= bps_hi and pps[i] >= pps_hi:
+                label = "DoS/DDoS"
+
+            labels.iloc[i] = label
+
+        return labels
 
     @staticmethod
     def _risk_label(score: float) -> str:

@@ -345,6 +345,8 @@ def load_kaggle_datasets(dataset_refs: list[str]) -> tuple[pd.DataFrame, list[Pa
         raise FileNotFoundError("No Kaggle datasets were loaded.")
 
     combined = pd.concat(frames, ignore_index=True)
+    if len(combined) > 150_000:
+        combined = combined.sample(frac=1, random_state=42).head(150_000).reset_index(drop=True)
     return prepare_flow_frame(combined), dataset_dirs, csv_files
 
 
